@@ -1,0 +1,244 @@
+#!/usr/bin/ruby
+# pds - parallel data substitution (doing 80% of sed 120% as well)
+
+USAGE = <<'EOF'
+pds [-i[BAK]] [-0] [-A] [-r] [-p] [-t] [-w] [-c[CHECK]] [-n[NTH]]
+    PATTERN REPLACEMENT [PATTERN REPLACEMENT]... -- FILES...
+             replaces each PATTERN with REPLACEMENT in the input, simultaneously
+
+  -i[BAK]    edit files in place (backup with suffix BAK if supplied)
+  -0         work on NUL terminated lines
+  -A         work on whole file at once
+  -r         enable regex for PATTERN and backreferences for REPLACEMENT
+             \& for the match, \1..\9 for n-th backreference, \c to clear line
+  -p         only print lines with replacements
+  -t         toggle; also replace each REPLACEMENT with PATTERN
+  -w         PATTERN shall only match whole words
+  -c[CHECK]  ensure there has been at least one (or CHECK) replacement per file
+  -n[NTH]    only replace NTH match (comma-separated list of numbers) per line
+
+EOF
+
+require 'fcntl'
+
+def fatal(msg)
+  STDERR.puts "pds: #{msg}"
+  exit -1
+end
+
+iflag = nil
+rflag = false
+nullflag = true
+nflag = []
+cflag = nil
+allflag = false
+pflag = false
+tflag = false
+wflag = false
+
+replacements = []
+nl = "\n"
+
+done = false
+until done
+  arg = ARGV.shift
+
+  case arg
+  when /\A-i/
+    iflag = $'
+  when "-r"
+    rflag = true
+  when "-p"
+    pflag = true
+  when "-t"
+    tflag = true
+  when "-w"
+    wflag = true
+  when "-0"
+    nl = "\0"
+    nullflag = true
+  when /\A-c/
+    cflag = $'
+  when "-A"
+    allflag = true
+  when /\A-n/
+    nflag.concat $'.split(',').map { |x| Integer(x) }
+  when /\A-/
+    fatal "invalid argument '#{arg}'\n#{USAGE}" 
+  else
+    if rflag && tflag
+      fatal "cannot use -r and -t together"
+    end
+
+    loop {
+      if !arg || arg == "--"
+        done = true
+        break
+      end
+
+      from = arg
+      to = ARGV.shift
+      if !to
+        STDERR.puts "no replacement for '#{from}'"
+        exit 1
+      end
+
+      replacements << [from, to]
+      replacements << [to, from]  if tflag
+
+      arg = ARGV.shift
+    }
+  end
+end
+if cflag
+  cflag = cflag.split(',').map { |x| Integer(x) }
+end
+
+if replacements.empty?
+  fatal "no pattern given\n#{USAGE}"
+end
+
+rx = replacements.map { |x|
+  begin
+    rflag ? Regexp.new(x[0]) : Regexp.quote(x[0])
+  rescue RegexpError
+    fatal "invalid regex: #{$!}"
+  end
+}
+if wflag
+  rx.map! { |x| /\b#{x}\b/ }
+end
+union = Regexp.union(rx)
+
+retval = 0
+
+ARGV << "-"  if ARGV.empty?
+ARGV.each { |file|
+  input =
+    if file == "-"
+      STDIN
+    else
+      begin
+        File.open(file)
+      rescue SystemCallError => e
+        fatal "can't read #{file}: #{e.to_s.sub(/ @ .*/, '')}"
+      end
+    end
+  output =
+    if iflag
+      begin
+        tmpname = "#{file}.pds.#{rand(2**32).to_s(36)}~"
+        File.open(tmpname, Fcntl::O_WRONLY | Fcntl::O_EXCL | Fcntl::O_CREAT)
+      rescue SystemCallError => e
+        fatal "couldn't open temporary file #{file}: #{e.to_s.sub(/ @ .*/, '')}"
+      end
+    else
+      STDOUT
+    end
+
+  reps = 0
+
+  while line = (allflag ? input.read : input.gets(nl))
+    newline = ""
+    lastpos = 0
+    offset = 0
+    nth = 0
+
+    if nullflag
+      # fix $ and \z behavior
+      line.chomp!(nl)
+    end
+
+    loop {
+      leftmost = nil
+      matched = nil
+      replace = nil
+
+      rx.each_with_index { |r, i|
+        if m = line.match(r, offset)
+          if !leftmost || m.offset(0).first < leftmost.first
+            leftmost = m.offset(0)
+            matched = m
+            replace = replacements[i][1]
+          end
+        end
+      }
+
+      if !matched
+        newline << line[offset..-1]
+        break
+      end
+
+      nth += 1
+
+      newline << line[offset...leftmost[0]]
+
+      if nflag.empty? || nflag.include?(nth)
+        reps += 1
+        if rflag
+          if replace == '\c'
+            newline = nil
+            break
+          end
+
+          newline << replace.gsub(/\\[1-9&]/) { |e|
+            if e == '\&'
+              matched[0]
+            else
+              matched[e[1].to_i]
+            end
+          }
+        else
+          newline << replace
+        end
+      else
+        newline << line[offset...leftmost[1]]
+      end
+
+      if offset == leftmost[1]
+        if offset == line.size
+          break
+        else
+          newline << line[offset]
+          offset += 1
+          next
+        end
+      else
+        offset = leftmost[1]
+      end
+
+      break  if offset >= line.size
+    }
+
+    if newline
+      if nullflag
+        newline << nl
+      end
+
+      if !pflag || nth > 0
+        output.write newline
+      end
+    end
+  
+    break  if allflag
+  end
+
+  if cflag
+    if (cflag.empty? && reps == 0) || !(cflag.empty? && !cflag.include?(reps))
+      File.delete(tmpname)  if iflag
+      output.close
+      retval = 1
+      next
+    end
+  end
+
+  if iflag
+    output.close
+    if !iflag.empty?
+      File.rename(file, file+iflag)
+    end
+    File.rename(tmpname, file)
+  end
+}
+
+exit retval
