@@ -2,13 +2,15 @@
 # pds - parallel data substitution (doing 80% of sed 120% as well)
 
 USAGE = <<'EOF'
-pds [-i[BAK]] [-0] [-A] [-r] [-p] [-t] [-w] [-c[CHECK]] [-n[NTH]]
+pds [-i[BAK]] [-0] [-A] [-g] [-r] [-p] [-t] [-w] [-c[CHECK]] [-n[NTH]]
     PATTERN REPLACEMENT [PATTERN REPLACEMENT]... -- FILES...
              replaces each PATTERN with REPLACEMENT in the input, simultaneously
 
   -i[BAK]    edit files in place (backup with suffix BAK if supplied)
   -0         work on NUL terminated lines
   -A         work on whole file at once
+  -g         guarded replacement: uses additional PATTERN for each REPLACEMENT,
+             the first needs to match as regexp anywhere on the line
   -r         enable regex for PATTERN and backreferences for REPLACEMENT
              \& for the match, \1..\9 for n-th backreference, \c to clear line
   -p         only print lines with replacements
@@ -27,6 +29,7 @@ def fatal(msg)
 end
 
 iflag = nil
+gflag = false
 rflag = false
 nullflag = true
 nflag = []
@@ -46,6 +49,8 @@ until done
   case arg
   when /\A-i/
     iflag = $'
+  when "-g"
+    gflag = true
   when "-r"
     rflag = true
   when "-p"
@@ -76,15 +81,21 @@ until done
         break
       end
 
-      from = arg
+      if gflag
+        guard = arg
+        from = ARGV.shift
+      else
+        guard = nil
+        from = arg
+      end
       to = ARGV.shift
       if !to
         STDERR.puts "no replacement for '#{from}'"
         exit 1
       end
 
-      replacements << [from, to]
-      replacements << [to, from]  if tflag
+      replacements << [guard, from, to]
+      replacements << [guard, to, from]  if tflag
 
       arg = ARGV.shift
     }
@@ -98,9 +109,17 @@ if replacements.empty?
   fatal "no pattern given\n#{USAGE}"
 end
 
+gx = replacements.map { |x|
+  begin
+    x[0] && Regexp.new(x[0])
+  rescue RegexpError
+    fatal "invalid regex: #{$!}"
+  end
+}
+
 rx = replacements.map { |x|
   begin
-    rflag ? Regexp.new(x[0]) : Regexp.quote(x[0])
+    rflag ? Regexp.new(x[1]) : Regexp.quote(x[1])
   rescue RegexpError
     fatal "invalid regex: #{$!}"
   end
@@ -155,11 +174,13 @@ ARGV.each { |file|
       replace = nil
 
       rx.each_with_index { |r, i|
+        next  if gx[i] && !line.match(gx[i])
+
         if m = line.match(r, offset)
           if !leftmost || m.offset(0).first < leftmost.first
             leftmost = m.offset(0)
             matched = m
-            replace = replacements[i][1]
+            replace = replacements[i][2]
           end
         end
       }
